@@ -1,58 +1,89 @@
 # ffmpeg_getPic
 
-使用 Bash + ffmpeg 批量扫描目录中的 mp4 视频，按配置的帧间隔抽取关键帧并保存到本地目录。
+使用 Bash + ffmpeg 定时扫描“所有日期目录（含历史）”中的新 mp4，按配置间隔抽取关键帧，并通过 HTTP API 上传图片。
 
 ## 功能
 
-- 自动递归扫描指定视频目录中的所有 mp4 文件
-- 按 FRAME_INTERVAL 控制抽帧间隔，默认 1800 帧
-- 每个视频单独生成一个本地输出目录
+- 持续轮询监听 `WATCH_ROOT/<YYYYMMDD>/` 下所有日期目录中的新 mp4（包含历史目录）
+- 按 `FRAME_INTERVAL` 控制抽帧间隔，默认 1800 帧
+- 抽出的 jpg 保存在 `OUTPUT_DIR/<YYYYMMDD>/` 下
+- 每张抽出的图片可自动上传到 `UPLOAD_URL`（`curl -X POST -F "site=cuhk" -F "date=YYYYMMDD" -F "file=@xxx.jpg"`）
+- 上传成功后会自动删除本地对应 jpg
+- 自动记录已处理视频与已上传图片，避免重复处理/重复上传
 
 ## 依赖
 
 运行前请确保系统中已安装：
 
 - ffmpeg
+- curl
 
 示例安装命令：
 
 ```bash
 sudo apt update
-sudo apt install -y ffmpeg
+sudo apt install -y ffmpeg curl
 ```
 
 ## 文件说明
 
-- extract_keyframes.sh：主脚本，负责抽帧与上传
-- config.conf：配置文件，包含本地路径和抽帧参数
-- videos/：默认视频目录，脚本会递归扫描其中的 mp4
+- extract_keyframes.sh：主脚本，负责抽帧
+- config.conf：配置文件，包含监听路径、抽帧参数、上传参数
+- output/：默认图片输出目录
+- .state/：默认处理记录目录（自动创建）
 
 ## 配置
 
 编辑 config.conf：
 
 ```bash
-# 视频目录（可使用绝对路径或相对脚本目录的路径）
-VIDEO_DIR=./videos
+# 监听根目录（脚本处理该目录下所有 YYYYMMDD 日期子目录，如 .../01/20260505）
+WATCH_ROOT=/home/craner/Downloads/easynvr_docker/r/easynvr_rec/PmpIE3MZlnAWD/01
 
-# 输出目录（每个视频会创建独立子目录）
+# 输出根目录；jpg 实际路径为「本目录/日期子目录/」
 OUTPUT_DIR=./output
 
 # 抽帧间隔：至少间隔多少帧再保存下一张关键帧
 FRAME_INTERVAL=1800
 
+# 轮询新视频间隔（秒）
+SCAN_INTERVAL=20
+
+# 是否上传
+UPLOAD_ENABLED=1
+
+# 上传接口
+UPLOAD_URL=http://aisafety.craner.hk/api/upload
+
+# 上传站点参数（接口 form-data: site）
+SITE=cuhk
+
+# 可选 Bearer Token
+UPLOAD_TOKEN=
+
+# 已处理记录目录
+STATE_DIR=./.state
 ```
 
 配置说明：
 
-- VIDEO_DIR：本地视频目录，支持绝对路径或相对脚本目录的相对路径
-- OUTPUT_DIR：本地图片输出目录
+- WATCH_ROOT：监听根目录，脚本会扫描其下所有日期目录 `WATCH_ROOT/<YYYYMMDD>/`
+- OUTPUT_DIR：本地输出根目录；图片写入 `OUTPUT_DIR/<YYYYMMDD>/`
 - FRAME_INTERVAL：每隔多少帧保存一次关键帧
+- SCAN_INTERVAL：每隔多少秒扫描一次所有日期目录是否有新 mp4
+- UPLOAD_ENABLED：是否上传抽出的图片
+- UPLOAD_URL：上传接口地址
+- SITE：上传站点参数，上传时会以 `site=<SITE>` 发送
+- date：脚本会自动从日期目录名识别并上传 `date=<YYYYMMDD>`
+- UPLOAD_TOKEN：Bearer 鉴权 token（如果接口需要）
+- STATE_DIR：记录状态文件，包含：
+  - `YYYYMMDD.processed`：已抽帧的视频路径
+  - `YYYYMMDD.uploaded`：已成功上传的图片路径
 
 ## 使用方法
 
-1. 把需要处理的 mp4 放入 VIDEO_DIR 指定的目录，例如默认的 videos/
-2. 修改 config.conf 中的视频目录和抽帧间隔
+1. 修改 `config.conf`（重点确认 `WATCH_ROOT`、`UPLOAD_URL`、字段名）
+2. 启动脚本
 3. 执行脚本：
 
 ```bash
@@ -60,15 +91,21 @@ chmod +x extract_keyframes.sh
 ./extract_keyframes.sh
 ```
 
+脚本会持续运行。你可以用 `Ctrl+C` 停止。
+
 ## 处理结果
 
-假设视频名为 sample.mp4：
+假设今天日期为 `20260505`，新视频为 `sample.mp4`：
 
-- 本地输出目录：OUTPUT_DIR/sample/
-- 生成图片：sample_000001.jpg、sample_000002.jpg ...
-- 抽帧逻辑当前以首帧 + 关键帧间隔控制输出数量
+- 生成图片路径示例：`OUTPUT_DIR/20260505/sample_000001.jpg`、`OUTPUT_DIR/20260505/sample_000002.jpg` …
+- 抽帧逻辑为：首帧 + 按 `FRAME_INTERVAL` 间隔选取的 I 帧
+- 每张图片通过 HTTP POST 上传到 `UPLOAD_URL`，请求格式等价于：`curl -X POST -F "site=cuhk" -F "date=20260503" -F "file=@xxx.jpg" http://aisafety.craner.hk/api/upload`
 
 ## 注意事项
 
-- 该脚本不再包含 SSH 认证或自动上传逻辑
-- 如需更改输出位置，修改 `OUTPUT_DIR` 即可
+- 脚本为常驻监听模式，会一直运行并按 `SCAN_INTERVAL` 轮询
+- 若当前没有任何日期目录，脚本会持续轮询等待
+- 上传采用固定字段名 `site` 与 `file`，需确保接口与此一致
+- 上传时自动携带 `date`（来自目录名），并在本地限制上传文件大小不超过 10MB，仅允许 `.jpg/.jpeg/.png/.gif/.webp`
+- 上传成功后会删除本地帧图，避免磁盘持续增长
+- 如上传失败，脚本会打印失败日志并继续后续处理
