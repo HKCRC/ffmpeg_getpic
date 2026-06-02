@@ -3,3 +3,6 @@ config.conf
 
 # 输出目录
 output/
+
+# 本地处理/上传状态（按日期的标记文件）
+.state/
