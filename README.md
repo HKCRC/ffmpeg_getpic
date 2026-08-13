@@ -4,9 +4,9 @@
 
 ## 功能
 
-- 持续轮询监听 `WATCH_ROOT/<YYYYMMDD>/` 下所有日期目录中的新 mp4（包含历史目录）
+- 持续递归扫描脚本内置的录像总根目录，处理任意通道/码流目录下日期目录中的新 mp4（包含历史目录）
 - 按 `FRAME_INTERVAL` 控制抽帧间隔，默认 1800 帧
-- 抽出的 jpg 保存在 `OUTPUT_DIR/<YYYYMMDD>/` 下
+- 抽出的 jpg 按原始相对路径保存在 `OUTPUT_DIR/<通道>/<码流>/<YYYYMMDD>/` 下
 - 每张抽出的图片可自动上传到 `UPLOAD_URL`（`curl -X POST -F "site=cuhk" -F "date=YYYYMMDD" -F "file=@xxx.jpg"`）
 - 上传成功后会自动删除本地对应 jpg
 - 自动记录已处理视频与已上传图片，避免重复处理/重复上传
@@ -28,7 +28,7 @@ sudo apt install -y ffmpeg curl
 ## 文件说明
 
 - extract_keyframes.sh：主脚本，负责抽帧
-- config.conf：配置文件，包含监听路径、抽帧参数、上传参数
+- config.conf：配置文件，包含抽帧参数和上传参数
 - output/：默认图片输出目录
 - .state/：默认处理记录目录（自动创建）
 
@@ -37,10 +37,7 @@ sudo apt install -y ffmpeg curl
 编辑 config.conf：
 
 ```bash
-# 监听根目录（脚本处理该目录下所有 YYYYMMDD 日期子目录，如 .../01/20260505）
-WATCH_ROOT=/home/craner/Downloads/easynvr_docker/r/easynvr_rec/PmpIE3MZlnAWD/01
-
-# 输出根目录；jpg 实际路径为「本目录/日期子目录/」
+# 输出根目录；jpg 会按录像总根目录下的原始相对路径分类保存
 OUTPUT_DIR=./output
 
 # 抽帧间隔：至少间隔多少帧再保存下一张关键帧
@@ -67,8 +64,8 @@ STATE_DIR=./.state
 
 配置说明：
 
-- WATCH_ROOT：监听根目录，脚本会扫描其下所有日期目录 `WATCH_ROOT/<YYYYMMDD>/`
-- OUTPUT_DIR：本地输出根目录；图片写入 `OUTPUT_DIR/<YYYYMMDD>/`
+- 录像总根目录固定写在 `extract_keyframes.sh` 中，脚本会递归扫描其下所有名为 `YYYYMMDD` 的日期目录
+- OUTPUT_DIR：本地输出根目录；图片保留日期目录在录像总根目录下的相对路径
 - FRAME_INTERVAL：每隔多少帧保存一次关键帧
 - SCAN_INTERVAL：每隔多少秒扫描一次所有日期目录是否有新 mp4
 - UPLOAD_ENABLED：是否上传抽出的图片
@@ -77,12 +74,12 @@ STATE_DIR=./.state
 - date：脚本会自动从日期目录名识别并上传 `date=<YYYYMMDD>`
 - UPLOAD_TOKEN：Bearer 鉴权 token（如果接口需要）
 - STATE_DIR：记录状态文件，包含：
-  - `YYYYMMDD.processed`：已抽帧的视频路径
-  - `YYYYMMDD.uploaded`：已成功上传的图片路径
+  - `<通道>/<码流>/YYYYMMDD.processed`：已抽帧的视频路径
+  - `<通道>/<码流>/YYYYMMDD.uploaded`：已成功上传的图片路径
 
 ## 使用方法
 
-1. 修改 `config.conf`（重点确认 `WATCH_ROOT`、`UPLOAD_URL`、字段名）
+1. 修改 `config.conf`（重点确认 `UPLOAD_URL`、字段名）
 2. 启动脚本
 3. 执行脚本：
 
@@ -97,7 +94,7 @@ chmod +x extract_keyframes.sh
 
 假设今天日期为 `20260505`，新视频为 `sample.mp4`：
 
-- 生成图片路径示例：`OUTPUT_DIR/20260505/sample_000001.jpg`、`OUTPUT_DIR/20260505/sample_000002.jpg` …
+- 生成图片路径示例：`OUTPUT_DIR/通道/Profile_1/20260505/sample_000001.jpg`、`OUTPUT_DIR/通道/Profile_1/20260505/sample_000002.jpg` …
 - 抽帧逻辑为：首帧 + 按 `FRAME_INTERVAL` 间隔选取的 I 帧
 - 每张图片通过 HTTP POST 上传到 `UPLOAD_URL`，请求格式等价于：`curl -X POST -F "site=cuhk" -F "date=20260503" -F "file=@xxx.jpg" http://aisafety.craner.hk/api/upload`
 

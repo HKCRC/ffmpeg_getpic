@@ -12,7 +12,7 @@ fi
 # shellcheck disable=SC1090
 source "${CONFIG_FILE}"
 
-WATCH_ROOT="${WATCH_ROOT:-./videos}"
+readonly RECORDINGS_ROOT="/home/craner/Downloads/easynvr_docker/r/easynvr_rec"
 OUTPUT_DIR="${OUTPUT_DIR:-./output}"
 FRAME_INTERVAL="${FRAME_INTERVAL:-1800}"
 SCAN_INTERVAL="${SCAN_INTERVAL:-20}"
@@ -22,9 +22,6 @@ SITE="${SITE:-cuhk}"
 UPLOAD_TOKEN="${UPLOAD_TOKEN:-}"
 STATE_DIR="${STATE_DIR:-${SCRIPT_DIR}/.state}"
 
-if [[ "${WATCH_ROOT}" != /* ]]; then
-  WATCH_ROOT="${SCRIPT_DIR}/${WATCH_ROOT}"
-fi
 if [[ "${OUTPUT_DIR}" != /* ]]; then
   OUTPUT_DIR="${SCRIPT_DIR}/${OUTPUT_DIR}"
 fi
@@ -36,17 +33,13 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
   echo "未找到 ffmpeg，请先安装 ffmpeg。"
   exit 1
 fi
-if ! command -v ffprobe >/dev/null 2>&1; then
-  echo "未找到 ffprobe，请先安装 ffmpeg（含 ffprobe）。"
-  exit 1
-fi
 if ! command -v curl >/dev/null 2>&1; then
   echo "未找到 curl，请先安装 curl。"
   exit 1
 fi
 
-if [[ ! -d "${WATCH_ROOT}" ]]; then
-  echo "监听根目录不存在: ${WATCH_ROOT}"
+if [[ ! -d "${RECORDINGS_ROOT}" ]]; then
+  echo "录像总根目录不存在: ${RECORDINGS_ROOT}"
   exit 1
 fi
 
@@ -73,121 +66,6 @@ build_video_stem() {
   local stem="${rel_no_ext//\//__}"
   stem="${stem// /_}"
   printf '%s' "${stem}"
-}
-
-# 文件头全零通常是录制失败产生的占位文件，无法抽帧
-video_is_corrupt_placeholder() {
-  local video_path="$1"
-  local sample_size=4096
-  local file_size
-  local non_zero_count
-
-  if ! file_size="$(stat -c%s -- "${video_path}" 2>/dev/null)"; then
-    return 1
-  fi
-
-  if [[ "${file_size}" -eq 0 ]]; then
-    return 0
-  fi
-
-  if [[ "${file_size}" -lt "${sample_size}" ]]; then
-    sample_size="${file_size}"
-  fi
-
-  non_zero_count="$(
-    head -c "${sample_size}" -- "${video_path}" \
-      | tr -d '\0' \
-      | wc -c \
-      | tr -d '[:space:]'
-  )"
-  [[ "${non_zero_count}" -eq 0 ]]
-}
-
-# ffprobe 能读到首个视频流时，认为视频可处理
-video_is_valid() {
-  local video_path="$1"
-  ffprobe -v error -select_streams v:0 \
-    -show_entries stream=codec_type \
-    -of csv=p=0 "${video_path}" >/dev/null 2>&1
-}
-
-# 按「日期目录/文件名」排序（文件名含 YYYYMMDDHHmmss，多帧含 _000001 等后缀）
-sort_paths_by_datetime() {
-  local path day base
-  while IFS= read -r path; do
-    [[ -n "${path}" ]] || continue
-    day="$(basename "$(dirname "${path}")")"
-    base="$(basename "${path}")"
-    printf '%s\t%s\n' "${day}/${base}" "${path}"
-  done | LC_ALL=C sort -t $'\t' -k1,1 | cut -f2-
-}
-
-list_sorted_days() {
-  local day_dir day
-  local -a days=()
-  local -A day_set=()
-
-  while IFS= read -r day_dir; do
-    day="$(basename "${day_dir}")"
-    if [[ "${day}" =~ ^[0-9]{8}$ ]] && [[ -z "${day_set[${day}]:-}" ]]; then
-      day_set["${day}"]=1
-      days+=("${day}")
-    fi
-  done < <(
-    {
-      find "${WATCH_ROOT}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null || true
-      find "${OUTPUT_DIR}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null || true
-    } | sort_paths_by_datetime
-  )
-
-  if [[ "${#days[@]}" -eq 0 ]]; then
-    return 0
-  fi
-
-  printf '%s\n' "$(printf '%s\n' "${days[@]}" | LC_ALL=C sort -u)"
-}
-
-day_is_fully_processed() {
-  local day="$1"
-  local processed_state_file="${STATE_DIR}/${day}.processed"
-  [[ -f "${processed_state_file}" ]] && grep -Fxq -- "__ALL_PROCESSED__" "${processed_state_file}"
-}
-
-video_is_processed() {
-  local video_path="$1"
-  local day="$2"
-  local processed_state_file="${STATE_DIR}/${day}.processed"
-  grep -Fxq -- "${video_path}" "${processed_state_file}" 2>/dev/null
-}
-
-mark_video_processed() {
-  local video_path="$1"
-  local day="$2"
-  local processed_state_file="${STATE_DIR}/${day}.processed"
-  printf '%s\n' "${video_path}" >> "${processed_state_file}"
-}
-
-upload_video_frames() {
-  local video_stem="$1"
-  local day_output_dir="$2"
-  local uploaded_state_file="$3"
-  local date_value="$4"
-  local frame_path
-  local -a frames=()
-
-  shopt -s nullglob
-  frames=("${day_output_dir}/${video_stem}_"*.jpg)
-  shopt -u nullglob
-
-  if [[ "${#frames[@]}" -eq 0 ]]; then
-    return 0
-  fi
-
-  mapfile -t frames < <(printf '%s\n' "${frames[@]}" | sort_paths_by_datetime)
-
-  for frame_path in "${frames[@]}"; do
-    upload_frame "${frame_path}" "${uploaded_state_file}" "${date_value}" || true
-  done
 }
 
 upload_frame() {
@@ -269,14 +147,11 @@ process_video() {
 
   echo "处理新视频: ${video_name}"
 
-  if ! ffmpeg -hide_banner -loglevel error -y \
+  ffmpeg -hide_banner -loglevel error -y \
     -i "${video_path}" \
     -vf "select='eq(n\\,0)+eq(pict_type\\,I)*gte(n-prev_selected_n\\,${FRAME_INTERVAL})'" \
     -vsync vfr \
-    "${day_output_dir}/${video_stem}_%06d.jpg"; then
-    echo "抽帧失败: ${video_name}"
-    return 1
-  fi
+    "${day_output_dir}/${video_stem}_%06d.jpg"
 
   shopt -s nullglob
   frames=("${day_output_dir}/${video_stem}_"*.jpg)
@@ -286,167 +161,113 @@ process_video() {
   echo "抽帧完成: ${video_name}，输出 ${extracted_count} 张"
 }
 
-# 收集所有日期目录下、尚未上传的 jpg，按日期+时间排序
-collect_pending_frames() {
-  local day day_output_dir uploaded_state_file frame_path
-  local -a pending=()
-  local -a day_frames=()
+upload_unuploaded_frames() {
+  local day_output_dir="$1"
+  local uploaded_state_file="$2"
+  local date_value="$3"
+  local frame_path
+  local -a frames
 
-  while IFS= read -r day; do
-    [[ -n "${day}" ]] || continue
+  shopt -s nullglob
+  frames=("${day_output_dir}/"*.jpg)
+  shopt -u nullglob
 
-    day_output_dir="${OUTPUT_DIR}/${day}"
-    uploaded_state_file="${STATE_DIR}/${day}.uploaded"
-
-    [[ -d "${day_output_dir}" ]] || continue
-    touch "${uploaded_state_file}"
-
-    shopt -s nullglob
-    day_frames=("${day_output_dir}/"*.jpg)
-    shopt -u nullglob
-
-    if [[ "${#day_frames[@]}" -eq 0 ]]; then
-      continue
-    fi
-
-    mapfile -t day_frames < <(printf '%s\n' "${day_frames[@]}" | sort_paths_by_datetime)
-
-    for frame_path in "${day_frames[@]}"; do
-      if grep -Fxq -- "${frame_path}" "${uploaded_state_file}" 2>/dev/null; then
-        continue
-      fi
-      if [[ ! -f "${frame_path}" ]]; then
-        continue
-      fi
-      pending+=("${frame_path}")
-    done
-  done < <(list_sorted_days)
-
-  if [[ "${#pending[@]}" -gt 0 ]]; then
-    printf '%s\n' "${pending[@]}"
-  fi
-}
-
-upload_pending_frames_globally() {
-  local frame_path date_value
-  local -a pending=()
-
-  mapfile -t pending < <(collect_pending_frames)
-
-  if [[ "${#pending[@]}" -eq 0 ]]; then
+  if [[ "${#frames[@]}" -eq 0 ]]; then
     return 0
   fi
 
-  echo "按时间顺序上传 ${#pending[@]} 张待传图片"
-
-  for frame_path in "${pending[@]}"; do
-    date_value="$(basename "$(dirname "${frame_path}")")"
-    upload_frame "${frame_path}" "${STATE_DIR}/${date_value}.uploaded" "${date_value}" || true
+  for frame_path in "${frames[@]}"; do
+    upload_frame "${frame_path}" "${uploaded_state_file}" "${date_value}" || true
   done
 }
 
-# 收集尚未抽帧的 mp4，按日期目录 + 文件名时间排序
-collect_unprocessed_videos() {
-  local day day_dir day_output_dir processed_state_file video_path
-  local -a mp4_files=()
-  local -a videos=()
+process_day() {
+  local day_dir="$1"
+  local day
+  local relative_day_dir
+  local day_output_dir
+  local processed_state_file
+  local uploaded_state_file
+  local legacy_processed_state_file
+  local processed_path
+  local video_path
+  local -a mp4_files
 
-  while IFS= read -r day; do
-    [[ -n "${day}" ]] || continue
+  day="$(basename "${day_dir}")"
+  relative_day_dir="${day_dir#${RECORDINGS_ROOT}/}"
+  day_output_dir="${OUTPUT_DIR}/${relative_day_dir}"
+  processed_state_file="${STATE_DIR}/${relative_day_dir}.processed"
+  uploaded_state_file="${STATE_DIR}/${relative_day_dir}.uploaded"
+  legacy_processed_state_file="${STATE_DIR}/${day}.processed"
 
-    if day_is_fully_processed "${day}"; then
-      continue
-    fi
+  mkdir -p "${day_output_dir}" "$(dirname "${processed_state_file}")"
 
-    day_dir="${WATCH_ROOT}/${day}"
-    day_output_dir="${OUTPUT_DIR}/${day}"
-    processed_state_file="${STATE_DIR}/${day}.processed"
-
-    [[ -d "${day_dir}" ]] || continue
-
-    mkdir -p "${day_output_dir}"
-    touch "${processed_state_file}" "${STATE_DIR}/${day}.uploaded"
-
-    mapfile -d '' mp4_files < <(find "${day_dir}" -type f -iname "*.mp4" -print0)
-
-    if [[ "${#mp4_files[@]}" -eq 0 ]]; then
-      continue
-    fi
-
-    mapfile -t mp4_files < <(printf '%s\n' "${mp4_files[@]}" | sort_paths_by_datetime)
-
-    for video_path in "${mp4_files[@]}"; do
-      if video_is_processed "${video_path}" "${day}"; then
-        continue
+  # 兼容旧版按日期共用的状态文件，只迁移属于当前日期目录的视频记录。
+  if [[ ! -e "${processed_state_file}" && -f "${legacy_processed_state_file}" ]]; then
+    while IFS= read -r processed_path; do
+      if [[ "${processed_path}" == "${day_dir}/"* ]]; then
+        printf '%s\n' "${processed_path}" >> "${processed_state_file}"
       fi
-      videos+=("${video_path}")
-    done
-  done < <(list_sorted_days)
-
-  if [[ "${#videos[@]}" -gt 0 ]]; then
-    printf '%s\n' "${videos[@]}"
+    done < "${legacy_processed_state_file}"
   fi
-}
 
-process_unprocessed_videos_in_order() {
-  local video_path day day_dir day_output_dir video_stem uploaded_state_file
-  local -a videos=()
+  touch "${processed_state_file}" "${uploaded_state_file}"
 
-  mapfile -t videos < <(collect_unprocessed_videos)
+  mapfile -d '' mp4_files < <(find "${day_dir}" -type f -iname "*.mp4" -print0)
 
-  if [[ "${#videos[@]}" -eq 0 ]]; then
+  if [[ "${#mp4_files[@]}" -eq 0 ]]; then
+    echo "日期目录暂无 mp4: ${day_dir}"
     return 0
   fi
 
-  for video_path in "${videos[@]}"; do
-    day="$(basename "$(dirname "${video_path}")")"
-    day_dir="${WATCH_ROOT}/${day}"
-    day_output_dir="${OUTPUT_DIR}/${day}"
-    uploaded_state_file="${STATE_DIR}/${day}.uploaded"
+  if grep -Fxq -- "__ALL_PROCESSED__" "${processed_state_file}"; then
+    echo "日期目录已标记为全部已处理: ${relative_day_dir}"
+    upload_unuploaded_frames "${day_output_dir}" "${uploaded_state_file}" "${day}"
+    return 0
+  fi
 
-    if video_is_corrupt_placeholder "${video_path}"; then
-      echo "跳过全零损坏占位视频: $(basename "${video_path}")"
-      mark_video_processed "${video_path}" "${day}"
+  for video_path in "${mp4_files[@]}"; do
+    if grep -Fxq -- "${video_path}" "${processed_state_file}"; then
       continue
     fi
 
-    if ! video_is_valid "${video_path}"; then
-      echo "ffprobe 检测视频不可读，跳过本轮: $(basename "${video_path}")"
-      continue
-    fi
-
-    if ! process_video "${video_path}" "${day_dir}" "${day_output_dir}"; then
-      continue
-    fi
-    mark_video_processed "${video_path}" "${day}"
-
-    video_stem="$(build_video_stem "${video_path}" "${day_dir}")"
-    upload_video_frames "${video_stem}" "${day_output_dir}" "${uploaded_state_file}" "${day}"
+    process_video "${video_path}" "${day_dir}" "${day_output_dir}"
+    printf '%s\n' "${video_path}" >> "${processed_state_file}"
   done
+
+  upload_unuploaded_frames "${day_output_dir}" "${uploaded_state_file}" "${day}"
 }
 
 process_all_days() {
+  local day_dir
   local day
   local found_any=0
+  local -a day_dirs
 
-  while IFS= read -r day; do
-    [[ -n "${day}" ]] || continue
-    found_any=1
-  done < <(list_sorted_days)
+  mapfile -d '' day_dirs < <(
+    find "${RECORDINGS_ROOT}" -mindepth 1 -type d -print0 | sort -z
+  )
 
-  if [[ "${found_any}" -eq 0 ]]; then
-    echo "未发现日期目录(YYYYMMDD): ${WATCH_ROOT}"
+  if [[ "${#day_dirs[@]}" -eq 0 ]]; then
+    echo "录像总根目录下暂无任何子目录: ${RECORDINGS_ROOT}"
     return 0
   fi
 
-  # 1. 先上传所有未传图片（跨日期按时间顺序）
-  upload_pending_frames_globally
+  for day_dir in "${day_dirs[@]}"; do
+    day="$(basename "${day_dir}")"
+    if [[ ! "${day}" =~ ^[0-9]{8}$ ]]; then
+      continue
+    fi
+    found_any=1
+    process_day "${day_dir}"
+  done
 
-  # 2. 再按日期+时间顺序抽帧，每段视频抽完立即上传
-  process_unprocessed_videos_in_order
+  if [[ "${found_any}" -eq 0 ]]; then
+    echo "未发现日期目录(YYYYMMDD): ${RECORDINGS_ROOT}"
+  fi
 }
 
-echo "开始监听根目录: ${WATCH_ROOT}"
+echo "开始扫描录像总根目录: ${RECORDINGS_ROOT}"
 echo "抽帧输出根目录: ${OUTPUT_DIR}"
 echo "上传地址: ${UPLOAD_URL}"
 echo "轮询间隔: ${SCAN_INTERVAL} 秒"
