@@ -12,7 +12,7 @@ fi
 # shellcheck disable=SC1090
 source "${CONFIG_FILE}"
 
-readonly RECORDINGS_ROOT="/home/craner/Downloads/easynvr_docker/r/easynvr_rec"
+readonly RECORDINGS_ROOT="/workspace/hik_download/YL18Data"
 OUTPUT_DIR="${OUTPUT_DIR:-./output}"
 FRAME_INTERVAL="${FRAME_INTERVAL:-1800}"
 SCAN_INTERVAL="${SCAN_INTERVAL:-20}"
@@ -21,6 +21,8 @@ UPLOAD_URL="${UPLOAD_URL:-http://aisafety.craner.hk/api/upload}"
 SITE="${SITE:-cuhk}"
 UPLOAD_TOKEN="${UPLOAD_TOKEN:-}"
 STATE_DIR="${STATE_DIR:-${SCRIPT_DIR}/.state}"
+DELETE_VIDEO_AFTER_UPLOAD="${DELETE_VIDEO_AFTER_UPLOAD:-1}"
+MAX_DATA_BYTES="${MAX_DATA_BYTES:-2147483648}"
 
 if [[ "${OUTPUT_DIR}" != /* ]]; then
   OUTPUT_DIR="${SCRIPT_DIR}/${OUTPUT_DIR}"
@@ -53,6 +55,10 @@ if ! [[ "${SCAN_INTERVAL}" =~ ^[0-9]+$ ]] || [[ "${SCAN_INTERVAL}" -le 0 ]]; the
 fi
 if [[ "${UPLOAD_ENABLED}" == "1" ]] && [[ -z "${SITE}" ]]; then
   echo "UPLOAD_ENABLED=1 时，SITE 不能为空。请在 config.conf 中设置 SITE。"
+  exit 1
+fi
+if ! [[ "${MAX_DATA_BYTES}" =~ ^[0-9]+$ ]] || [[ "${MAX_DATA_BYTES}" -le 0 ]]; then
+  echo "MAX_DATA_BYTES 必须是正整数，当前值: ${MAX_DATA_BYTES}"
   exit 1
 fi
 
@@ -181,6 +187,141 @@ upload_unuploaded_frames() {
   done
 }
 
+# 某视频对应帧全部上传完毕（本地无残留 jpg）时，删除原 mp4。
+maybe_delete_video_after_upload() {
+  local video_path="$1"
+  local day_dir="$2"
+  local day_output_dir="$3"
+  local video_stem
+  local -a remaining_frames
+
+  if [[ "${DELETE_VIDEO_AFTER_UPLOAD}" != "1" ]]; then
+    return 0
+  fi
+  if [[ "${UPLOAD_ENABLED}" != "1" ]]; then
+    return 0
+  fi
+  if [[ ! -f "${video_path}" ]]; then
+    return 0
+  fi
+
+  video_stem="$(build_video_stem "${video_path}" "${day_dir}")"
+  shopt -s nullglob
+  remaining_frames=("${day_output_dir}/${video_stem}_"*.jpg)
+  shopt -u nullglob
+
+  if [[ "${#remaining_frames[@]}" -gt 0 ]]; then
+    return 0
+  fi
+
+  if rm -f -- "${video_path}"; then
+    echo "已上传完毕，删除原视频: ${video_path}"
+  else
+    echo "删除原视频失败: ${video_path}"
+  fi
+}
+
+cleanup_processed_videos_for_day() {
+  local day_dir="$1"
+  local day_output_dir="$2"
+  local processed_state_file="$3"
+  local video_path
+
+  if [[ "${DELETE_VIDEO_AFTER_UPLOAD}" != "1" ]]; then
+    return 0
+  fi
+  if [[ ! -f "${processed_state_file}" ]]; then
+    return 0
+  fi
+
+  while IFS= read -r video_path; do
+    [[ -z "${video_path}" || "${video_path}" == "__ALL_PROCESSED__" ]] && continue
+    [[ -f "${video_path}" ]] || continue
+    maybe_delete_video_after_upload "${video_path}" "${day_dir}" "${day_output_dir}"
+  done < "${processed_state_file}"
+}
+
+dir_size_bytes() {
+  local target="$1"
+  local size
+  size="$(du -sb -- "${target}" 2>/dev/null | awk '{print $1}')"
+  printf '%s' "${size:-0}"
+}
+
+# 超限时按 mtime 从旧到新删除已处理的 mp4，并清理空日期目录。
+enforce_data_quota() {
+  local total_size
+  local video_path
+  local day_dir
+  local relative_day_dir
+  local processed_state_file
+  local -a candidates
+
+  if [[ ! -d "${RECORDINGS_ROOT}" ]]; then
+    return 0
+  fi
+
+  total_size="$(dir_size_bytes "${RECORDINGS_ROOT}")"
+  if [[ "${total_size}" -le "${MAX_DATA_BYTES}" ]]; then
+    return 0
+  fi
+
+  echo "YL18Data 用量 ${total_size} 字节，超过上限 ${MAX_DATA_BYTES}，开始清理已处理视频..."
+
+  mapfile -d '' candidates < <(
+    find "${RECORDINGS_ROOT}" -type f -iname "*.mp4" -printf '%T@\t%p\0' \
+      | sort -z -n \
+      | cut -z -f2-
+  )
+
+  for video_path in "${candidates[@]}"; do
+    total_size="$(dir_size_bytes "${RECORDINGS_ROOT}")"
+    if [[ "${total_size}" -le "${MAX_DATA_BYTES}" ]]; then
+      break
+    fi
+
+    day_dir="$(dirname "${video_path}")"
+    relative_day_dir="${day_dir#${RECORDINGS_ROOT}/}"
+    # 仅删除位于 YYYYMMDD 日期目录下的文件
+    if [[ ! "$(basename "${day_dir}")" =~ ^[0-9]{8}$ ]]; then
+      continue
+    fi
+    processed_state_file="${STATE_DIR}/${relative_day_dir}.processed"
+    if [[ ! -f "${processed_state_file}" ]]; then
+      continue
+    fi
+    if ! grep -Fxq -- "${video_path}" "${processed_state_file}"; then
+      continue
+    fi
+
+    if rm -f -- "${video_path}"; then
+      echo "配额清理，删除已处理视频: ${video_path}"
+    else
+      echo "配额清理失败: ${video_path}"
+    fi
+  done
+
+  # 清理空日期目录
+  local -a empty_day_dirs=()
+  local day
+  mapfile -d '' empty_day_dirs < <(
+    find "${RECORDINGS_ROOT}" -mindepth 1 -maxdepth 1 -type d -print0
+  )
+  for day_dir in "${empty_day_dirs[@]+"${empty_day_dirs[@]}"}"; do
+    day="$(basename "${day_dir}")"
+    if [[ ! "${day}" =~ ^[0-9]{8}$ ]]; then
+      continue
+    fi
+    if [[ -z "$(find "${day_dir}" -type f -print -quit)" ]]; then
+      rmdir --ignore-fail-on-non-empty -- "${day_dir}" 2>/dev/null || true
+      echo "已清理空日期目录: ${day_dir}"
+    fi
+  done
+
+  total_size="$(dir_size_bytes "${RECORDINGS_ROOT}")"
+  echo "配额清理后 YL18Data 用量: ${total_size} 字节"
+}
+
 process_day() {
   local day_dir="$1"
   local day
@@ -217,12 +358,14 @@ process_day() {
 
   if [[ "${#mp4_files[@]}" -eq 0 ]]; then
     echo "日期目录暂无 mp4: ${day_dir}"
+    upload_unuploaded_frames "${day_output_dir}" "${uploaded_state_file}" "${day}"
     return 0
   fi
 
   if grep -Fxq -- "__ALL_PROCESSED__" "${processed_state_file}"; then
     echo "日期目录已标记为全部已处理: ${relative_day_dir}"
     upload_unuploaded_frames "${day_output_dir}" "${uploaded_state_file}" "${day}"
+    cleanup_processed_videos_for_day "${day_dir}" "${day_output_dir}" "${processed_state_file}"
     return 0
   fi
 
@@ -233,9 +376,14 @@ process_day() {
 
     process_video "${video_path}" "${day_dir}" "${day_output_dir}"
     printf '%s\n' "${video_path}" >> "${processed_state_file}"
+
+    # 立刻上传该视频刚抽出的帧，成功后即可删原片
+    upload_unuploaded_frames "${day_output_dir}" "${uploaded_state_file}" "${day}"
+    maybe_delete_video_after_upload "${video_path}" "${day_dir}" "${day_output_dir}"
   done
 
   upload_unuploaded_frames "${day_output_dir}" "${uploaded_state_file}" "${day}"
+  cleanup_processed_videos_for_day "${day_dir}" "${day_output_dir}" "${processed_state_file}"
 }
 
 process_all_days() {
@@ -250,6 +398,7 @@ process_all_days() {
 
   if [[ "${#day_dirs[@]}" -eq 0 ]]; then
     echo "录像总根目录下暂无任何子目录: ${RECORDINGS_ROOT}"
+    enforce_data_quota
     return 0
   fi
 
@@ -265,12 +414,16 @@ process_all_days() {
   if [[ "${found_any}" -eq 0 ]]; then
     echo "未发现日期目录(YYYYMMDD): ${RECORDINGS_ROOT}"
   fi
+
+  enforce_data_quota
 }
 
 echo "开始扫描录像总根目录: ${RECORDINGS_ROOT}"
 echo "抽帧输出根目录: ${OUTPUT_DIR}"
 echo "上传地址: ${UPLOAD_URL}"
 echo "轮询间隔: ${SCAN_INTERVAL} 秒"
+echo "上传后删原视频: ${DELETE_VIDEO_AFTER_UPLOAD}"
+echo "Data 上限: ${MAX_DATA_BYTES} 字节"
 
 while true; do
   process_all_days
