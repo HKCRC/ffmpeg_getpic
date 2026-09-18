@@ -20,6 +20,8 @@ UPLOAD_ENABLED="${UPLOAD_ENABLED:-1}"
 UPLOAD_URL="${UPLOAD_URL:-http://aisafety.craner.hk/api/upload}"
 SITE="${SITE:-cuhk}"
 UPLOAD_TOKEN="${UPLOAD_TOKEN:-}"
+# 与上传 API / 下载窗口对齐；文件名中 HHMMSS 落在窗外则跳过上传并清理本地
+UPLOAD_TIME_WINDOWS="${UPLOAD_TIME_WINDOWS:-09:00:00-11:00:00 14:00:00-17:45:00}"
 STATE_DIR="${STATE_DIR:-${SCRIPT_DIR}/.state}"
 DELETE_VIDEO_AFTER_UPLOAD="${DELETE_VIDEO_AFTER_UPLOAD:-1}"
 MAX_DATA_BYTES="${MAX_DATA_BYTES:-2147483648}"
@@ -74,18 +76,73 @@ build_video_stem() {
   printf '%s' "${stem}"
 }
 
+# 从 YYYYMMDDHHMMSS-*.jpg / *.mp4 文件名解析 HHMMSS；解析失败返回空
+parse_name_hhmmss() {
+  local base
+  base="$(basename "$1")"
+  if [[ "${base}" =~ ^[0-9]{8}([0-9]{2})([0-9]{2})([0-9]{2}) ]]; then
+    printf '%s%s%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+  fi
+}
+
+# HHMMSS 是否落在 UPLOAD_TIME_WINDOWS（格式 HH:MM:SS-HH:MM:SS）内
+is_hhmmss_allowed() {
+  local hhmmss="$1"
+  local window start_hms end_hms start_cmp end_cmp
+
+  if [[ -z "${hhmmss}" ]]; then
+    return 0
+  fi
+  if [[ -z "${UPLOAD_TIME_WINDOWS}" ]]; then
+    return 0
+  fi
+
+  for window in ${UPLOAD_TIME_WINDOWS}; do
+    if [[ "${window}" != *-* ]]; then
+      continue
+    fi
+    start_hms="${window%%-*}"
+    end_hms="${window##*-}"
+    start_cmp="${start_hms//:/}"
+    end_cmp="${end_hms//:/}"
+    # 10# 避免 09xxxx 被当成八进制
+    if (( 10#${hhmmss} >= 10#${start_cmp} && 10#${hhmmss} <= 10#${end_cmp} )); then
+      return 0
+    fi
+  done
+  return 1
+}
+
+mark_uploaded_and_remove() {
+  local frame_path="$1"
+  local uploaded_state_file="$2"
+  if ! grep -Fxq -- "${frame_path}" "${uploaded_state_file}"; then
+    printf '%s\n' "${frame_path}" >> "${uploaded_state_file}"
+  fi
+  rm -f -- "${frame_path}" || true
+}
+
 upload_frame() {
   local frame_path="$1"
   local uploaded_state_file="$2"
   local date_value="$3"
   local ext_lower
   local file_size
+  local hhmmss
+  local http_code
+  local resp_body
+  local resp_file
 
   if [[ "${UPLOAD_ENABLED}" != "1" ]]; then
     return 0
   fi
 
+  # 已成功上传过但本地又出现同路径文件（重复抽帧）时，直接清掉残留
   if grep -Fxq -- "${frame_path}" "${uploaded_state_file}"; then
+    if [[ -f "${frame_path}" ]]; then
+      rm -f -- "${frame_path}" || true
+      echo "已上传记录存在，清理本地残留: $(basename "${frame_path}")"
+    fi
     return 0
   fi
 
@@ -95,10 +152,17 @@ upload_frame() {
     jpg|jpeg|png|gif|webp) ;;
     *)
       echo "跳过不支持的图片格式: ${frame_path}"
-      printf '%s\n' "${frame_path}" >> "${uploaded_state_file}"
+      mark_uploaded_and_remove "${frame_path}" "${uploaded_state_file}"
       return 0
       ;;
   esac
+
+  hhmmss="$(parse_name_hhmmss "${frame_path}")"
+  if [[ -n "${hhmmss}" ]] && ! is_hhmmss_allowed "${hhmmss}"; then
+    echo "跳过上传时间窗外的帧 (${hhmmss}): $(basename "${frame_path}")"
+    mark_uploaded_and_remove "${frame_path}" "${uploaded_state_file}"
+    return 0
+  fi
 
   if ! file_size="$(stat -c%s -- "${frame_path}")"; then
     echo "读取文件大小失败，跳过: ${frame_path}"
@@ -106,12 +170,13 @@ upload_frame() {
   fi
   if [[ "${file_size}" -gt 10485760 ]]; then
     echo "跳过超过 10MB 的文件: ${frame_path}"
-    printf '%s\n' "${frame_path}" >> "${uploaded_state_file}"
+    mark_uploaded_and_remove "${frame_path}" "${uploaded_state_file}"
     return 0
   fi
 
+  resp_file="$(mktemp)"
   local -a curl_args=(
-    -fsS
+    -sS
     --retry 2
     --retry-delay 1
     -X POST
@@ -119,21 +184,32 @@ upload_frame() {
     -F "site=${SITE}"
     -F "date=${date_value}"
     -F "file=@${frame_path}"
+    -o "${resp_file}"
+    -w "%{http_code}"
   )
 
   if [[ -n "${UPLOAD_TOKEN}" ]]; then
     curl_args+=(-H "Authorization: Bearer ${UPLOAD_TOKEN}")
   fi
 
-  if curl "${curl_args[@]}" >/dev/null; then
-    printf '%s\n' "${frame_path}" >> "${uploaded_state_file}"
-    if rm -f -- "${frame_path}"; then
-      echo "已上传并删除本地文件: $(basename "${frame_path}")"
-    else
-      echo "已上传，但删除本地文件失败: ${frame_path}"
-    fi
+  http_code="$(curl "${curl_args[@]}" || true)"
+  resp_body="$(cat "${resp_file}" 2>/dev/null || true)"
+  rm -f -- "${resp_file}"
+
+  if [[ "${http_code}" == "200" || "${http_code}" == "201" ]]; then
+    mark_uploaded_and_remove "${frame_path}" "${uploaded_state_file}"
+    echo "已上传并删除本地文件: $(basename "${frame_path}")"
   else
-    echo "上传失败: ${frame_path}"
+    echo "上传失败 (HTTP ${http_code}): ${frame_path}"
+    if [[ -n "${resp_body}" ]]; then
+      echo "  响应: ${resp_body}"
+    fi
+    # 永久拒绝：时间窗外，记入已处理并删本地，避免反复重试
+    if [[ "${resp_body}" == *"UPLOAD_TIME_NOT_ALLOWED"* ]]; then
+      echo "  判定为时间窗外，清理本地残留"
+      mark_uploaded_and_remove "${frame_path}" "${uploaded_state_file}"
+      return 0
+    fi
     return 1
   fi
 }
@@ -147,8 +223,20 @@ process_video() {
   local video_stem
   local extracted_count
   local -a frames
+  local hhmmss
 
   video_name="$(basename "${video_path}")"
+  hhmmss="$(parse_name_hhmmss "${video_name}")"
+  if [[ -n "${hhmmss}" ]] && ! is_hhmmss_allowed "${hhmmss}"; then
+    echo "跳过时间窗外视频 (${hhmmss}): ${video_name}"
+    if [[ "${DELETE_VIDEO_AFTER_UPLOAD}" == "1" ]]; then
+      if rm -f -- "${video_path}"; then
+        echo "已删除时间窗外原视频: ${video_path}"
+      fi
+    fi
+    return 0
+  fi
+
   video_stem="$(build_video_stem "${video_path}" "${day_dir}")"
 
   echo "处理新视频: ${video_name}"
@@ -391,6 +479,9 @@ process_all_days() {
   local day
   local found_any=0
   local -a day_dirs
+  local -a output_day_dirs
+  local day_output_dir
+  local uploaded_state_file
 
   mapfile -d '' day_dirs < <(
     find "${RECORDINGS_ROOT}" -mindepth 1 -type d -print0 | sort -z
@@ -398,11 +489,9 @@ process_all_days() {
 
   if [[ "${#day_dirs[@]}" -eq 0 ]]; then
     echo "录像总根目录下暂无任何子目录: ${RECORDINGS_ROOT}"
-    enforce_data_quota
-    return 0
   fi
 
-  for day_dir in "${day_dirs[@]}"; do
+  for day_dir in "${day_dirs[@]+"${day_dirs[@]}"}"; do
     day="$(basename "${day_dir}")"
     if [[ ! "${day}" =~ ^[0-9]{8}$ ]]; then
       continue
@@ -415,12 +504,30 @@ process_all_days() {
     echo "未发现日期目录(YYYYMMDD): ${RECORDINGS_ROOT}"
   fi
 
+  # 录像日期目录被配额清理后，仍扫描 output 残留帧并上传/清理
+  mapfile -d '' output_day_dirs < <(
+    find "${OUTPUT_DIR}" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z
+  )
+  for day_output_dir in "${output_day_dirs[@]+"${output_day_dirs[@]}"}"; do
+    day="$(basename "${day_output_dir}")"
+    if [[ ! "${day}" =~ ^[0-9]{8}$ ]]; then
+      continue
+    fi
+    if [[ -d "${RECORDINGS_ROOT}/${day}" ]]; then
+      continue
+    fi
+    uploaded_state_file="${STATE_DIR}/${day}.uploaded"
+    touch "${uploaded_state_file}"
+    upload_unuploaded_frames "${day_output_dir}" "${uploaded_state_file}" "${day}"
+  done
+
   enforce_data_quota
 }
 
 echo "开始扫描录像总根目录: ${RECORDINGS_ROOT}"
 echo "抽帧输出根目录: ${OUTPUT_DIR}"
 echo "上传地址: ${UPLOAD_URL}"
+echo "上传时间窗口: ${UPLOAD_TIME_WINDOWS}"
 echo "轮询间隔: ${SCAN_INTERVAL} 秒"
 echo "上传后删原视频: ${DELETE_VIDEO_AFTER_UPLOAD}"
 echo "Data 上限: ${MAX_DATA_BYTES} 字节"
