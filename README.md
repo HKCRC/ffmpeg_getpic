@@ -7,7 +7,7 @@
 - 持续递归扫描脚本内置的录像总根目录，处理任意通道/码流目录下日期目录中的新 mp4（包含历史目录）
 - 按 `FRAME_INTERVAL` 控制抽帧间隔，默认 1800 帧
 - 抽出的 jpg 按原始相对路径保存在 `OUTPUT_DIR/<通道>/<码流>/<YYYYMMDD>/` 下
-- 每张抽出的图片可自动上传到 `UPLOAD_URL`（`curl -X POST -F "site=cuhk" -F "date=YYYYMMDD" -F "file=@xxx.jpg"`）
+- 每张抽出的图片可自动上传到 `UPLOAD_URL`（`curl -X POST -F "site=<SITE>" -F "date=YYYYMMDD" -F "file=@xxx.jpg"`）
 - 上传成功后会自动删除本地对应 jpg
 - 自动记录已处理视频与已上传图片，避免重复处理/重复上传
 
@@ -52,8 +52,8 @@ UPLOAD_ENABLED=1
 # 上传接口
 UPLOAD_URL=http://aisafety.craner.hk/api/upload
 
-# 上传站点参数（接口 form-data: site）
-SITE=cuhk
+# 站点编码，每次部署不同（例如 yl18、tm101），同时作为上传字段 site
+SITE=site_code
 
 # 可选 Bearer Token
 UPLOAD_TOKEN=
@@ -64,7 +64,7 @@ STATE_DIR=./.state
 
 配置说明：
 
-- 录像总根目录固定写在 `extract_keyframes.sh` 中，脚本会递归扫描其下所有名为 `YYYYMMDD` 的日期目录
+- 录像总根目录来自 `RECORDINGS_ROOT`；省略时按 `SITE` 使用 `/workspace/hik_download/<SITE>Data`，并递归扫描其下所有名为 `YYYYMMDD` 的日期目录
 - OUTPUT_DIR：本地输出根目录；图片保留日期目录在录像总根目录下的相对路径
 - FRAME_INTERVAL：每隔多少帧保存一次关键帧
 - SCAN_INTERVAL：每隔多少秒扫描一次所有日期目录是否有新 mp4
@@ -96,7 +96,7 @@ chmod +x extract_keyframes.sh
 
 - 生成图片路径示例：`OUTPUT_DIR/通道/Profile_1/20260505/sample_000001.jpg`、`OUTPUT_DIR/通道/Profile_1/20260505/sample_000002.jpg` …
 - 抽帧逻辑为：首帧 + 按 `FRAME_INTERVAL` 间隔选取的 I 帧
-- 每张图片通过 HTTP POST 上传到 `UPLOAD_URL`，请求格式等价于：`curl -X POST -F "site=cuhk" -F "date=20260503" -F "file=@xxx.jpg" http://aisafety.craner.hk/api/upload`
+- 每张图片通过 HTTP POST 上传到 `UPLOAD_URL`，请求格式等价于：`curl -X POST -F "site=<SITE>" -F "date=20260503" -F "file=@xxx.jpg" http://aisafety.craner.hk/api/upload`
 
 ## 注意事项
 

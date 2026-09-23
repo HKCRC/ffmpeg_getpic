@@ -12,13 +12,20 @@ fi
 # shellcheck disable=SC1090
 source "${CONFIG_FILE}"
 
-readonly RECORDINGS_ROOT="/workspace/hik_download/YL18Data"
+SITE="${SITE:-}"
+if [[ -z "${RECORDINGS_ROOT:-}" ]]; then
+  if [[ -z "${SITE}" ]]; then
+    echo "请在 config.conf 中设置 SITE，或直接设置 RECORDINGS_ROOT。"
+    exit 1
+  fi
+  RECORDINGS_ROOT="/workspace/hik_download/${SITE}Data"
+fi
+readonly RECORDINGS_ROOT
 OUTPUT_DIR="${OUTPUT_DIR:-./output}"
 FRAME_INTERVAL="${FRAME_INTERVAL:-1800}"
 SCAN_INTERVAL="${SCAN_INTERVAL:-20}"
 UPLOAD_ENABLED="${UPLOAD_ENABLED:-1}"
 UPLOAD_URL="${UPLOAD_URL:-http://aisafety.craner.hk/api/upload}"
-SITE="${SITE:-cuhk}"
 UPLOAD_TOKEN="${UPLOAD_TOKEN:-}"
 # 与上传 API / 下载窗口对齐；文件名中 HHMMSS 落在窗外则跳过上传并清理本地
 UPLOAD_TIME_WINDOWS="${UPLOAD_TIME_WINDOWS:-09:00:00-11:00:00 14:00:00-17:45:00}"
@@ -354,7 +361,7 @@ enforce_data_quota() {
     return 0
   fi
 
-  echo "YL18Data 用量 ${total_size} 字节，超过上限 ${MAX_DATA_BYTES}，开始清理已处理视频..."
+  echo "录像目录用量 ${total_size} 字节，超过上限 ${MAX_DATA_BYTES}，开始清理已处理视频..."
 
   mapfile -d '' candidates < <(
     find "${RECORDINGS_ROOT}" -type f -iname "*.mp4" -printf '%T@\t%p\0' \
@@ -407,7 +414,7 @@ enforce_data_quota() {
   done
 
   total_size="$(dir_size_bytes "${RECORDINGS_ROOT}")"
-  echo "配额清理后 YL18Data 用量: ${total_size} 字节"
+  echo "配额清理后录像目录用量: ${total_size} 字节"
 }
 
 process_day() {
