@@ -66,6 +66,8 @@ UPLOAD_TOKEN="${UPLOAD_TOKEN:-}"
 UPLOAD_TIME_WINDOWS="${UPLOAD_TIME_WINDOWS:-09:00:00-11:00:00 14:00:00-17:45:00}"
 STATE_DIR="${STATE_DIR:-${SCRIPT_DIR}/.state}"
 DELETE_VIDEO_AFTER_UPLOAD="${DELETE_VIDEO_AFTER_UPLOAD:-1}"
+# 每个日期目录保留最接近这些时刻的各一段，不删除
+KEEP_DAILY_TIMES="${KEEP_DAILY_TIMES:-10:00:00 15:00:00}"
 MAX_DATA_BYTES="${MAX_DATA_BYTES:-2147483648}"
 
 if [[ "${OUTPUT_DIR}" != /* ]]; then
@@ -160,6 +162,65 @@ is_hhmmss_allowed() {
     end_cmp="${end_hms//:/}"
     # 10# 避免 09xxxx 被当成八进制
     if (( 10#${hhmmss} >= 10#${start_cmp} && 10#${hhmmss} <= 10#${end_cmp} )); then
+      return 0
+    fi
+  done
+  return 1
+}
+
+hhmmss_to_seconds() {
+  local hhmmss="$1"
+  printf '%s' $(( 10#${hhmmss:0:2} * 3600 + 10#${hhmmss:2:2} * 60 + 10#${hhmmss:4:2} ))
+}
+
+# 同一日期目录里，上午/下午各选最接近目标时刻的一段。
+pick_kept_daily_video() {
+  local day_dir="$1"
+  local target_hms="$2"
+  local target_sec target_hour best_path best_diff
+  local video_path hhmmss video_sec diff
+  local -a videos
+
+  target_hms="${target_hms//:/}"
+  target_sec="$(hhmmss_to_seconds "${target_hms}")"
+  target_hour=$(( 10#${target_hms:0:2} ))
+  best_path=""
+  best_diff=999999
+
+  shopt -s nullglob
+  videos=("${day_dir}/"*.mp4 "${day_dir}/"*.MP4)
+  shopt -u nullglob
+
+  for video_path in "${videos[@]}"; do
+    hhmmss="$(parse_name_hhmmss "${video_path}")"
+    [[ -n "${hhmmss}" ]] || continue
+    video_sec="$(hhmmss_to_seconds "${hhmmss}")"
+    if (( target_hour < 12 )); then
+      (( video_sec >= 12 * 3600 )) && continue
+    else
+      (( video_sec < 12 * 3600 )) && continue
+    fi
+    if (( video_sec >= target_sec )); then
+      diff=$(( video_sec - target_sec ))
+    else
+      diff=$(( target_sec - video_sec ))
+    fi
+    if (( diff < best_diff )); then
+      best_diff="${diff}"
+      best_path="${video_path}"
+    fi
+  done
+
+  printf '%s' "${best_path}"
+}
+
+is_kept_daily_video() {
+  local video_path="$1"
+  local day_dir target kept
+  day_dir="$(dirname "${video_path}")"
+  for target in ${KEEP_DAILY_TIMES}; do
+    kept="$(pick_kept_daily_video "${day_dir}" "${target}")"
+    if [[ -n "${kept}" && "${kept}" == "${video_path}" ]]; then
       return 0
     fi
   done
@@ -283,10 +344,12 @@ process_video() {
   hhmmss="$(parse_name_hhmmss "${video_name}")"
   if [[ -n "${hhmmss}" ]] && ! is_hhmmss_allowed "${hhmmss}"; then
     echo "跳过时间窗外视频 (${hhmmss}): ${video_name}"
-    if [[ "${DELETE_VIDEO_AFTER_UPLOAD}" == "1" ]]; then
+    if [[ "${DELETE_VIDEO_AFTER_UPLOAD}" == "1" ]] && ! is_kept_daily_video "${video_path}"; then
       if rm -f -- "${video_path}"; then
         echo "已删除时间窗外原视频: ${video_path}"
       fi
+    elif is_kept_daily_video "${video_path}"; then
+      echo "保留每天定点录像: ${video_path}"
     fi
     return 0
   fi
@@ -354,6 +417,11 @@ maybe_delete_video_after_upload() {
   shopt -u nullglob
 
   if [[ "${#remaining_frames[@]}" -gt 0 ]]; then
+    return 0
+  fi
+
+  if is_kept_daily_video "${video_path}"; then
+    echo "保留每天定点录像: ${video_path}"
     return 0
   fi
 
@@ -441,6 +509,9 @@ enforce_data_quota() {
       continue
     fi
     if ! grep -Fxq -- "${video_path}" "${processed_state_file}"; then
+      continue
+    fi
+    if is_kept_daily_video "${video_path}"; then
       continue
     fi
 
