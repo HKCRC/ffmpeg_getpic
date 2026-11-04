@@ -12,6 +12,24 @@ fi
 # shellcheck disable=SC1090
 source "${CONFIG_FILE}"
 
+HIK_ROOT="$(cd "${SCRIPT_DIR}/../hik_download" 2>/dev/null && pwd || true)"
+
+# 配置里的目录不存在时，改用 hik_download 旁边的同名目录。
+prefer_local_dir() {
+  local configured="$1"
+  local name
+  if [[ -d "${configured}" ]]; then
+    printf '%s' "${configured}"
+    return
+  fi
+  name="$(basename "${configured}")"
+  if [[ -n "${HIK_ROOT}" && -d "${HIK_ROOT}/${name}" ]]; then
+    printf '%s' "${HIK_ROOT}/${name}"
+    return
+  fi
+  printf '%s' "${configured}"
+}
+
 SITE="${SITE:-}"
 if [[ -z "${RECORDINGS_ROOT:-}" ]]; then
   if [[ -z "${SITE}" ]]; then
@@ -20,7 +38,24 @@ if [[ -z "${RECORDINGS_ROOT:-}" ]]; then
   fi
   RECORDINGS_ROOT="/workspace/hik_download/${SITE}Data"
 fi
+RECORDINGS_ROOT="$(prefer_local_dir "${RECORDINGS_ROOT}")"
 readonly RECORDINGS_ROOT
+
+EXTRA_RECORDINGS="${EXTRA_RECORDINGS:-}"
+if [[ -n "${EXTRA_RECORDINGS}" ]]; then
+  remapped_recordings=""
+  for spec in ${EXTRA_RECORDINGS}; do
+    root="${spec%%=*}"
+    site="${spec#*=}"
+    if [[ -z "${root}" || -z "${site}" || "${root}" == "${spec}" ]]; then
+      remapped_recordings+="${spec} "
+      continue
+    fi
+    remapped_recordings+="$(prefer_local_dir "${root}")=${site} "
+  done
+  EXTRA_RECORDINGS="${remapped_recordings% }"
+  unset remapped_recordings spec root site
+fi
 OUTPUT_DIR="${OUTPUT_DIR:-./output}"
 FRAME_INTERVAL="${FRAME_INTERVAL:-1800}"
 SCAN_INTERVAL="${SCAN_INTERVAL:-20}"
@@ -65,6 +100,17 @@ fi
 if [[ "${UPLOAD_ENABLED}" == "1" ]] && [[ -z "${SITE}" ]]; then
   echo "UPLOAD_ENABLED=1 时，SITE 不能为空。请在 config.conf 中设置 SITE。"
   exit 1
+fi
+if [[ -n "${EXTRA_RECORDINGS}" ]]; then
+  for _extra_spec in ${EXTRA_RECORDINGS}; do
+    _extra_root="${_extra_spec%%=*}"
+    _extra_site="${_extra_spec#*=}"
+    if [[ -z "${_extra_root}" || -z "${_extra_site}" || "${_extra_root}" == "${_extra_spec}" ]]; then
+      echo "EXTRA_RECORDINGS 格式应为 目录=站点，当前: ${_extra_spec}"
+      exit 1
+    fi
+  done
+  unset _extra_spec _extra_root _extra_site
 fi
 if ! [[ "${MAX_DATA_BYTES}" =~ ^[0-9]+$ ]] || [[ "${MAX_DATA_BYTES}" -le 0 ]]; then
   echo "MAX_DATA_BYTES 必须是正整数，当前值: ${MAX_DATA_BYTES}"
@@ -133,6 +179,7 @@ upload_frame() {
   local frame_path="$1"
   local uploaded_state_file="$2"
   local date_value="$3"
+  local site="${4:-${SITE}}"
   local ext_lower
   local file_size
   local hhmmss
@@ -188,7 +235,7 @@ upload_frame() {
     --retry-delay 1
     -X POST
     "${UPLOAD_URL}"
-    -F "site=${SITE}"
+    -F "site=${site}"
     -F "date=${date_value}"
     -F "file=@${frame_path}"
     -o "${resp_file}"
@@ -266,6 +313,7 @@ upload_unuploaded_frames() {
   local day_output_dir="$1"
   local uploaded_state_file="$2"
   local date_value="$3"
+  local site="${4:-${SITE}}"
   local frame_path
   local -a frames
 
@@ -278,7 +326,7 @@ upload_unuploaded_frames() {
   fi
 
   for frame_path in "${frames[@]}"; do
-    upload_frame "${frame_path}" "${uploaded_state_file}" "${date_value}" || true
+    upload_frame "${frame_path}" "${uploaded_state_file}" "${date_value}" "${site}" || true
   done
 }
 
@@ -345,38 +393,45 @@ dir_size_bytes() {
 
 # 超限时按 mtime 从旧到新删除已处理的 mp4，并清理空日期目录。
 enforce_data_quota() {
+  local recordings_root="$1"
+  local name_prefix="${2:-}"
   local total_size
   local video_path
   local day_dir
   local relative_day_dir
   local processed_state_file
+  local root_name
   local -a candidates
 
-  if [[ ! -d "${RECORDINGS_ROOT}" ]]; then
+  if [[ ! -d "${recordings_root}" ]]; then
     return 0
   fi
 
-  total_size="$(dir_size_bytes "${RECORDINGS_ROOT}")"
+  root_name="$(basename "${recordings_root}")"
+  total_size="$(dir_size_bytes "${recordings_root}")"
   if [[ "${total_size}" -le "${MAX_DATA_BYTES}" ]]; then
     return 0
   fi
 
-  echo "录像目录用量 ${total_size} 字节，超过上限 ${MAX_DATA_BYTES}，开始清理已处理视频..."
+  echo "${root_name} 用量 ${total_size} 字节，超过上限 ${MAX_DATA_BYTES}，开始清理已处理视频..."
 
   mapfile -d '' candidates < <(
-    find "${RECORDINGS_ROOT}" -type f -iname "*.mp4" -printf '%T@\t%p\0' \
+    find "${recordings_root}" -type f -iname "*.mp4" -printf '%T@\t%p\0' \
       | sort -z -n \
       | cut -z -f2-
   )
 
   for video_path in "${candidates[@]}"; do
-    total_size="$(dir_size_bytes "${RECORDINGS_ROOT}")"
+    total_size="$(dir_size_bytes "${recordings_root}")"
     if [[ "${total_size}" -le "${MAX_DATA_BYTES}" ]]; then
       break
     fi
 
     day_dir="$(dirname "${video_path}")"
-    relative_day_dir="${day_dir#${RECORDINGS_ROOT}/}"
+    relative_day_dir="${day_dir#${recordings_root}/}"
+    if [[ -n "${name_prefix}" ]]; then
+      relative_day_dir="${name_prefix}/${relative_day_dir}"
+    fi
     # 仅删除位于 YYYYMMDD 日期目录下的文件
     if [[ ! "$(basename "${day_dir}")" =~ ^[0-9]{8}$ ]]; then
       continue
@@ -400,7 +455,7 @@ enforce_data_quota() {
   local -a empty_day_dirs=()
   local day
   mapfile -d '' empty_day_dirs < <(
-    find "${RECORDINGS_ROOT}" -mindepth 1 -maxdepth 1 -type d -print0
+    find "${recordings_root}" -mindepth 1 -maxdepth 1 -type d -print0
   )
   for day_dir in "${empty_day_dirs[@]+"${empty_day_dirs[@]}"}"; do
     day="$(basename "${day_dir}")"
@@ -413,12 +468,15 @@ enforce_data_quota() {
     fi
   done
 
-  total_size="$(dir_size_bytes "${RECORDINGS_ROOT}")"
-  echo "配额清理后录像目录用量: ${total_size} 字节"
+  total_size="$(dir_size_bytes "${recordings_root}")"
+  echo "配额清理后 ${root_name} 用量: ${total_size} 字节"
 }
 
 process_day() {
   local day_dir="$1"
+  local recordings_root="${2:-${RECORDINGS_ROOT}}"
+  local site="${3:-${SITE}}"
+  local name_prefix="${4:-}"
   local day
   local relative_day_dir
   local day_output_dir
@@ -430,7 +488,10 @@ process_day() {
   local -a mp4_files
 
   day="$(basename "${day_dir}")"
-  relative_day_dir="${day_dir#${RECORDINGS_ROOT}/}"
+  relative_day_dir="${day_dir#${recordings_root}/}"
+  if [[ -n "${name_prefix}" ]]; then
+    relative_day_dir="${name_prefix}/${relative_day_dir}"
+  fi
   day_output_dir="${OUTPUT_DIR}/${relative_day_dir}"
   processed_state_file="${STATE_DIR}/${relative_day_dir}.processed"
   uploaded_state_file="${STATE_DIR}/${relative_day_dir}.uploaded"
@@ -453,13 +514,13 @@ process_day() {
 
   if [[ "${#mp4_files[@]}" -eq 0 ]]; then
     echo "日期目录暂无 mp4: ${day_dir}"
-    upload_unuploaded_frames "${day_output_dir}" "${uploaded_state_file}" "${day}"
+    upload_unuploaded_frames "${day_output_dir}" "${uploaded_state_file}" "${day}" "${site}"
     return 0
   fi
 
   if grep -Fxq -- "__ALL_PROCESSED__" "${processed_state_file}"; then
     echo "日期目录已标记为全部已处理: ${relative_day_dir}"
-    upload_unuploaded_frames "${day_output_dir}" "${uploaded_state_file}" "${day}"
+    upload_unuploaded_frames "${day_output_dir}" "${uploaded_state_file}" "${day}" "${site}"
     cleanup_processed_videos_for_day "${day_dir}" "${day_output_dir}" "${processed_state_file}"
     return 0
   fi
@@ -473,29 +534,46 @@ process_day() {
     printf '%s\n' "${video_path}" >> "${processed_state_file}"
 
     # 立刻上传该视频刚抽出的帧，成功后即可删原片
-    upload_unuploaded_frames "${day_output_dir}" "${uploaded_state_file}" "${day}"
+    upload_unuploaded_frames "${day_output_dir}" "${uploaded_state_file}" "${day}" "${site}"
     maybe_delete_video_after_upload "${video_path}" "${day_dir}" "${day_output_dir}"
   done
 
-  upload_unuploaded_frames "${day_output_dir}" "${uploaded_state_file}" "${day}"
+  upload_unuploaded_frames "${day_output_dir}" "${uploaded_state_file}" "${day}" "${site}"
   cleanup_processed_videos_for_day "${day_dir}" "${day_output_dir}" "${processed_state_file}"
 }
 
-process_all_days() {
+process_root() {
+  local recordings_root="$1"
+  local site="$2"
+  local name_prefix="${3:-}"
   local day_dir
   local day
   local found_any=0
+  local output_base
+  local state_base
   local -a day_dirs
   local -a output_day_dirs
   local day_output_dir
   local uploaded_state_file
 
+  if [[ ! -d "${recordings_root}" ]]; then
+    return 0
+  fi
+
+  if [[ -n "${name_prefix}" ]]; then
+    output_base="${OUTPUT_DIR}/${name_prefix}"
+    state_base="${STATE_DIR}/${name_prefix}"
+  else
+    output_base="${OUTPUT_DIR}"
+    state_base="${STATE_DIR}"
+  fi
+
   mapfile -d '' day_dirs < <(
-    find "${RECORDINGS_ROOT}" -mindepth 1 -type d -print0 | sort -z
+    find "${recordings_root}" -mindepth 1 -type d -print0 | sort -z
   )
 
   if [[ "${#day_dirs[@]}" -eq 0 ]]; then
-    echo "录像总根目录下暂无任何子目录: ${RECORDINGS_ROOT}"
+    echo "录像目录下暂无任何子目录: ${recordings_root}"
   fi
 
   for day_dir in "${day_dirs[@]+"${day_dirs[@]}"}"; do
@@ -504,34 +582,60 @@ process_all_days() {
       continue
     fi
     found_any=1
-    process_day "${day_dir}"
+    process_day "${day_dir}" "${recordings_root}" "${site}" "${name_prefix}"
   done
 
   if [[ "${found_any}" -eq 0 ]]; then
-    echo "未发现日期目录(YYYYMMDD): ${RECORDINGS_ROOT}"
+    echo "未发现日期目录(YYYYMMDD): ${recordings_root}"
   fi
 
   # 录像日期目录被配额清理后，仍扫描 output 残留帧并上传/清理
-  mapfile -d '' output_day_dirs < <(
-    find "${OUTPUT_DIR}" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z
-  )
-  for day_output_dir in "${output_day_dirs[@]+"${output_day_dirs[@]}"}"; do
-    day="$(basename "${day_output_dir}")"
-    if [[ ! "${day}" =~ ^[0-9]{8}$ ]]; then
-      continue
-    fi
-    if [[ -d "${RECORDINGS_ROOT}/${day}" ]]; then
-      continue
-    fi
-    uploaded_state_file="${STATE_DIR}/${day}.uploaded"
-    touch "${uploaded_state_file}"
-    upload_unuploaded_frames "${day_output_dir}" "${uploaded_state_file}" "${day}"
-  done
+  if [[ -d "${output_base}" ]]; then
+    mapfile -d '' output_day_dirs < <(
+      find "${output_base}" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z
+    )
+    for day_output_dir in "${output_day_dirs[@]+"${output_day_dirs[@]}"}"; do
+      day="$(basename "${day_output_dir}")"
+      if [[ ! "${day}" =~ ^[0-9]{8}$ ]]; then
+        continue
+      fi
+      if [[ -d "${recordings_root}/${day}" ]]; then
+        continue
+      fi
+      uploaded_state_file="${state_base}/${day}.uploaded"
+      mkdir -p "$(dirname "${uploaded_state_file}")"
+      touch "${uploaded_state_file}"
+      upload_unuploaded_frames "${day_output_dir}" "${uploaded_state_file}" "${day}" "${site}"
+    done
+  fi
 
-  enforce_data_quota
+  enforce_data_quota "${recordings_root}" "${name_prefix}"
 }
 
-echo "开始扫描录像总根目录: ${RECORDINGS_ROOT}"
+process_all_days() {
+  local spec
+  local extra_root
+  local extra_site
+  local extra_key
+
+  process_root "${RECORDINGS_ROOT}" "${SITE}" ""
+
+  if [[ -z "${EXTRA_RECORDINGS}" ]]; then
+    return 0
+  fi
+
+  for spec in ${EXTRA_RECORDINGS}; do
+    extra_root="${spec%%=*}"
+    extra_site="${spec#*=}"
+    extra_key="$(basename "${extra_root}")"
+    process_root "${extra_root}" "${extra_site}" "${extra_key}"
+  done
+}
+
+echo "开始扫描录像总根目录: ${RECORDINGS_ROOT} (site=${SITE})"
+if [[ -n "${EXTRA_RECORDINGS}" ]]; then
+  echo "额外录像: ${EXTRA_RECORDINGS}"
+fi
 echo "抽帧输出根目录: ${OUTPUT_DIR}"
 echo "上传地址: ${UPLOAD_URL}"
 echo "上传时间窗口: ${UPLOAD_TIME_WINDOWS}"
