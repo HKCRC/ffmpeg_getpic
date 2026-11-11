@@ -60,6 +60,10 @@ OUTPUT_DIR="${OUTPUT_DIR:-./output}"
 FRAME_INTERVAL="${FRAME_INTERVAL:-1800}"
 # 解码、滤镜、编码共用的线程上限。0 会被 ffmpeg 当成自动，等于占满全部核心
 FFMPEG_THREADS="${FFMPEG_THREADS:-2}"
+# cpu：软件解码。cuda：NVDEC 只解关键帧，再按 FRAME_INTERVAL 换算的时间间隔抽帧。
+# cuda 失败或这路编码没有对应解码器时，这一段自动改回 cpu。
+FFMPEG_HWACCEL="${FFMPEG_HWACCEL:-cuda}"
+FFMPEG_HWACCEL_DEVICE="${FFMPEG_HWACCEL_DEVICE:-0}"
 SCAN_INTERVAL="${SCAN_INTERVAL:-20}"
 UPLOAD_ENABLED="${UPLOAD_ENABLED:-1}"
 UPLOAD_URL="${UPLOAD_URL:-http://aisafety.craner.hk/api/upload}"
@@ -112,6 +116,26 @@ fi
 if ! [[ "${FFMPEG_THREADS}" =~ ^[0-9]+$ ]] || [[ "${FFMPEG_THREADS}" -le 0 ]]; then
   echo "FFMPEG_THREADS 必须是正整数，当前值: ${FFMPEG_THREADS}"
   exit 1
+fi
+case "${FFMPEG_HWACCEL}" in
+  cpu|cuda) ;;
+  *)
+    echo "FFMPEG_HWACCEL 只能是 cpu 或 cuda，当前值: ${FFMPEG_HWACCEL}"
+    exit 1
+    ;;
+esac
+if ! [[ "${FFMPEG_HWACCEL_DEVICE}" =~ ^[0-9]+$ ]]; then
+  echo "FFMPEG_HWACCEL_DEVICE 必须是非负整数，当前值: ${FFMPEG_HWACCEL_DEVICE}"
+  exit 1
+fi
+if [[ "${FFMPEG_HWACCEL}" == "cuda" ]]; then
+  if ! ffmpeg -hide_banner -hwaccels 2>/dev/null | grep -qx 'cuda'; then
+    echo "ffmpeg 没有 cuda 硬件解码，抽帧改用 CPU"
+    FFMPEG_HWACCEL=cpu
+  elif ! nvidia-smi -L >/dev/null 2>&1; then
+    echo "未检测到 NVIDIA GPU，抽帧改用 CPU"
+    FFMPEG_HWACCEL=cpu
+  fi
 fi
 if ! [[ "${SCAN_INTERVAL}" =~ ^[0-9]+$ ]] || [[ "${SCAN_INTERVAL}" -le 0 ]]; then
   echo "SCAN_INTERVAL 必须是正整数，当前值: ${SCAN_INTERVAL}"
@@ -888,6 +912,76 @@ upload_frame() {
   fi
 }
 
+# 第一行编码名，第二行帧率（如 25/1）。读不到时两行都可能为空。
+video_stream_info() {
+  local video_path="$1"
+  ffprobe -v error -select_streams v:0 \
+    -show_entries stream=codec_name,avg_frame_rate \
+    -of default=noprint_wrappers=1:nokey=1 -- "${video_path}" 2>/dev/null || true
+}
+
+cuvid_decoder_for() {
+  case "$1" in
+    hevc|h265) printf '%s' hevc_cuvid ;;
+    h264) printf '%s' h264_cuvid ;;
+    mpeg2video) printf '%s' mpeg2_cuvid ;;
+    mpeg4) printf '%s' mpeg4_cuvid ;;
+    mjpeg) printf '%s' mjpeg_cuvid ;;
+    vp8) printf '%s' vp8_cuvid ;;
+    vp9) printf '%s' vp9_cuvid ;;
+    av1) printf '%s' av1_cuvid ;;
+    *) return 1 ;;
+  esac
+}
+
+# FRAME_INTERVAL 是帧数。GPU 只输出关键帧，n 不再是原始帧号，所以改用时间间隔。
+frame_interval_seconds() {
+  local rate="$1"
+  awk -v n="${FRAME_INTERVAL}" -v r="${rate}" 'BEGIN {
+    split(r, a, "/")
+    den = (a[2] == "" || a[2] + 0 == 0) ? 1 : a[2]
+    fps = a[1] / den
+    if (fps <= 0) fps = 25
+    printf "%.6f", n / fps
+  }'
+}
+
+extract_frames_cpu() {
+  local video_path="$1"
+  local tmp_dir="$2"
+  local log_file="$3"
+  ffmpeg -hide_banner -nostdin -loglevel info -y \
+    -threads "${FFMPEG_THREADS}" \
+    -filter_threads "${FFMPEG_THREADS}" \
+    -i "${video_path}" \
+    -vf "select='eq(n\\,0)+eq(pict_type\\,I)*gte(n-prev_selected_n\\,${FRAME_INTERVAL})',showinfo" \
+    -threads "${FFMPEG_THREADS}" \
+    -vsync vfr \
+    "${tmp_dir}/frame_%06d.jpg" 2>"${log_file}"
+}
+
+# NVDEC 解关键帧。hevc_cuvid 不会填写 pict_type，也不能用 key 标志，所以用 -skip_frame nokey。
+extract_frames_gpu() {
+  local video_path="$1"
+  local tmp_dir="$2"
+  local log_file="$3"
+  local decoder="$4"
+  local interval="$5"
+  ffmpeg -hide_banner -nostdin -loglevel info -y \
+    -hwaccel cuda \
+    -hwaccel_device "${FFMPEG_HWACCEL_DEVICE}" \
+    -hwaccel_output_format cuda \
+    -c:v "${decoder}" \
+    -skip_frame nokey \
+    -threads "${FFMPEG_THREADS}" \
+    -i "${video_path}" \
+    -vf "hwdownload,format=nv12,select='eq(n\\,0)+gte(t-prev_selected_t\\,${interval})',showinfo" \
+    -filter_threads "${FFMPEG_THREADS}" \
+    -threads "${FFMPEG_THREADS}" \
+    -vsync vfr \
+    "${tmp_dir}/frame_%06d.jpg" 2>"${log_file}"
+}
+
 process_video() {
   local video_path="$1"
   local day_dir="$2"
@@ -911,23 +1005,42 @@ process_video() {
   fi
 
   video_stem="$(build_video_stem "${video_path}" "${day_dir}")"
-  echo "处理新视频: ${video_name}"
+
+  local codec rate decoder interval extracted=0
+  local -a stream_info
+  mapfile -t stream_info < <(video_stream_info "${video_path}")
+  codec="${stream_info[0]:-}"
+  rate="${stream_info[1]:-}"
+  decoder=""
+  if [[ "${FFMPEG_HWACCEL}" == "cuda" ]]; then
+    decoder="$(cuvid_decoder_for "${codec}" || true)"
+  fi
+
+  if [[ -n "${decoder}" ]]; then
+    echo "处理新视频: ${video_name} (cuda:${FFMPEG_HWACCEL_DEVICE} ${decoder})"
+  else
+    echo "处理新视频: ${video_name} (cpu)"
+  fi
 
   # 先写临时目录，拿到每张帧的 pts_time 后再按真实时刻改名，
   # 否则同一片段内 20 张帧会共用片段开始时间，窗口判定全是错的。
   tmp_dir="$(mktemp -d)"
   log_file="${tmp_dir}/showinfo.log"
-  if ! ffmpeg -hide_banner -nostdin -loglevel info -y \
-    -threads "${FFMPEG_THREADS}" \
-    -filter_threads "${FFMPEG_THREADS}" \
-    -i "${video_path}" \
-    -vf "select='eq(n\\,0)+eq(pict_type\\,I)*gte(n-prev_selected_n\\,${FRAME_INTERVAL})',showinfo" \
-    -threads "${FFMPEG_THREADS}" \
-    -vsync vfr \
-    "${tmp_dir}/frame_%06d.jpg" 2>"${log_file}"; then
-    echo "抽帧失败: ${video_name}"
-    rm -rf -- "${tmp_dir}"
-    return 1
+  if [[ -n "${decoder}" ]]; then
+    interval="$(frame_interval_seconds "${rate}")"
+    if extract_frames_gpu "${video_path}" "${tmp_dir}" "${log_file}" "${decoder}" "${interval}"; then
+      extracted=1
+    else
+      echo "GPU 抽帧失败，改用 CPU: ${video_name}"
+      rm -f -- "${tmp_dir}"/frame_*.jpg "${log_file}"
+    fi
+  fi
+  if [[ "${extracted}" -eq 0 ]]; then
+    if ! extract_frames_cpu "${video_path}" "${tmp_dir}" "${log_file}"; then
+      echo "抽帧失败: ${video_name}"
+      rm -rf -- "${tmp_dir}"
+      return 1
+    fi
   fi
 
   mapfile -t pts_list < <(
@@ -1442,6 +1555,11 @@ if [[ -n "${EXTRA_RECORDINGS}" ]]; then
 fi
 echo "抽帧输出根目录: ${OUTPUT_DIR}"
 echo "ffmpeg 线程数: ${FFMPEG_THREADS}"
+if [[ "${FFMPEG_HWACCEL}" == "cuda" ]]; then
+  echo "ffmpeg 设备: cuda:${FFMPEG_HWACCEL_DEVICE}"
+else
+  echo "ffmpeg 设备: cpu"
+fi
 echo "上传地址: ${UPLOAD_URL}"
 echo "上传时间窗口: ${UPLOAD_TIME_WINDOWS}"
 echo "轮询间隔: ${SCAN_INTERVAL} 秒"
