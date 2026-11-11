@@ -58,6 +58,8 @@ if [[ -n "${EXTRA_RECORDINGS}" ]]; then
 fi
 OUTPUT_DIR="${OUTPUT_DIR:-./output}"
 FRAME_INTERVAL="${FRAME_INTERVAL:-1800}"
+# 解码、滤镜、编码共用的线程上限。0 会被 ffmpeg 当成自动，等于占满全部核心
+FFMPEG_THREADS="${FFMPEG_THREADS:-2}"
 SCAN_INTERVAL="${SCAN_INTERVAL:-20}"
 UPLOAD_ENABLED="${UPLOAD_ENABLED:-1}"
 UPLOAD_URL="${UPLOAD_URL:-http://aisafety.craner.hk/api/upload}"
@@ -105,6 +107,10 @@ fi
 
 if ! [[ "${FRAME_INTERVAL}" =~ ^[0-9]+$ ]] || [[ "${FRAME_INTERVAL}" -le 0 ]]; then
   echo "FRAME_INTERVAL 必须是正整数，当前值: ${FRAME_INTERVAL}"
+  exit 1
+fi
+if ! [[ "${FFMPEG_THREADS}" =~ ^[0-9]+$ ]] || [[ "${FFMPEG_THREADS}" -le 0 ]]; then
+  echo "FFMPEG_THREADS 必须是正整数，当前值: ${FFMPEG_THREADS}"
   exit 1
 fi
 if ! [[ "${SCAN_INTERVAL}" =~ ^[0-9]+$ ]] || [[ "${SCAN_INTERVAL}" -le 0 ]]; then
@@ -912,8 +918,11 @@ process_video() {
   tmp_dir="$(mktemp -d)"
   log_file="${tmp_dir}/showinfo.log"
   if ! ffmpeg -hide_banner -nostdin -loglevel info -y \
+    -threads "${FFMPEG_THREADS}" \
+    -filter_threads "${FFMPEG_THREADS}" \
     -i "${video_path}" \
     -vf "select='eq(n\\,0)+eq(pict_type\\,I)*gte(n-prev_selected_n\\,${FRAME_INTERVAL})',showinfo" \
+    -threads "${FFMPEG_THREADS}" \
     -vsync vfr \
     "${tmp_dir}/frame_%06d.jpg" 2>"${log_file}"; then
     echo "抽帧失败: ${video_name}"
@@ -1432,6 +1441,7 @@ if [[ -n "${EXTRA_RECORDINGS}" ]]; then
   echo "额外录像: ${EXTRA_RECORDINGS}"
 fi
 echo "抽帧输出根目录: ${OUTPUT_DIR}"
+echo "ffmpeg 线程数: ${FFMPEG_THREADS}"
 echo "上传地址: ${UPLOAD_URL}"
 echo "上传时间窗口: ${UPLOAD_TIME_WINDOWS}"
 echo "轮询间隔: ${SCAN_INTERVAL} 秒"
